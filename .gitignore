@@ -20,6 +20,7 @@
 !.nycrc
 !.yamllint.yaml
 !.configurations/
+!.claude/
 !/.npmrc
 
 # === Rules for root dir ===
