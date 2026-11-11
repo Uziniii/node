@@ -23,6 +23,7 @@
 #include <cstdio>
 #include "async_wrap-inl.h"
 #include "crypto/crypto_bio.h"
+#include "crypto/crypto_client_hello.h"
 #include "crypto/crypto_common.h"
 #include "crypto/crypto_context.h"
 #include "crypto/crypto_util.h"
@@ -72,6 +73,20 @@ namespace crypto {
 
 namespace {
 
+void InjectOpenSSLErrorForTesting(const FunctionCallbackInfo<Value>&) {
+#if NCRYPTO_USE_OPENSSL_PROVIDER
+  ERR_raise(ERR_LIB_USER, ERR_R_INTERNAL_ERROR);
+#elif NCRYPTO_USE_BORINGSSL
+  ERR_put_error(ERR_LIB_USER, 0, ERR_R_INTERNAL_ERROR, __FILE__, __LINE__);
+#else
+#error "Unsupported crypto backend"
+#endif
+}
+
+void HasOpenSSLErrorForTesting(const FunctionCallbackInfo<Value>& args) {
+  args.GetReturnValue().Set(ERR_peek_error() != 0);
+}
+
 // Our custom implementation of the certificate verify callback
 // used when establishing a TLS handshake. Because we cannot perform
 // I/O quickly enough with X509_STORE_CTX_ APIs in this callback,
@@ -80,7 +95,7 @@ namespace {
 // that the user user Connection::VerifyError after the `secure`
 // callback has been made.
 int VerifyCallback(int preverify_ok, X509_STORE_CTX* ctx) {
-  // From https://www.openssl.org/docs/man1.1.1/man3/SSL_verify_cb:
+  // From https://www.openssl.org/docs/man3.0/man3/SSL_verify_cb:
   //
   //   If VerifyCallback returns 1, the verification process is continued. If
   //   VerifyCallback always returns 1, the TLS/SSL handshake will not be
@@ -104,40 +119,18 @@ SSL_SESSION* GetSessionCallback(
 // The TLS library invokes this before version negotiation and before session
 // or ticket resumption, which makes async session lookup possible. If required
 // the handshake is suspended here and resumed once JS has answered.
-#ifdef OPENSSL_IS_BORINGSSL
-ssl_select_cert_result_t EarlyClientHelloCallback(const SSL_CLIENT_HELLO* ch) {
-  TLSWrap* w = static_cast<TLSWrap*>(SSL_get_app_data(ch->ssl));
-  if (!w->should_suspend_for_client_hello()) return ssl_select_cert_success;
+ClientHelloResult EarlyClientHelloCallback(const ClientHelloContext& hello) {
+  TLSWrap* w = static_cast<TLSWrap*>(SSL_get_app_data(hello.ssl()));
+  if (!w->should_suspend_for_client_hello()) {
+    return ClientHelloResult::kContinue;
+  }
 
-  const uint8_t* ext;
-  size_t ext_len;
-  bool has_ticket = SSL_early_callback_ctx_extension_get(
-                        ch, TLSEXT_TYPE_session_ticket, &ext, &ext_len) &&
-                    ext_len > 0;
-
-  return w->OnEarlyClientHello(ch->session_id, ch->session_id_len, has_ticket)
-             ? ssl_select_cert_success
-             : ssl_select_cert_retry;
+  auto session_id = hello.session_id();
+  return w->OnEarlyClientHello(
+             session_id.data(), session_id.size(), hello.has_session_ticket())
+             ? ClientHelloResult::kContinue
+             : ClientHelloResult::kRetry;
 }
-#else
-int EarlyClientHelloCallback(SSL* s, int* al, void* arg) {
-  TLSWrap* w = static_cast<TLSWrap*>(SSL_get_app_data(s));
-  if (!w->should_suspend_for_client_hello()) return SSL_CLIENT_HELLO_SUCCESS;
-
-  const unsigned char* session_id;
-  size_t session_id_len = SSL_client_hello_get0_session_id(s, &session_id);
-
-  const unsigned char* ext;
-  size_t ext_len;
-  bool has_ticket = SSL_client_hello_get0_ext(
-                        s, TLSEXT_TYPE_session_ticket, &ext, &ext_len) == 1 &&
-                    ext_len > 0;
-
-  return w->OnEarlyClientHello(session_id, session_id_len, has_ticket)
-             ? SSL_CLIENT_HELLO_SUCCESS
-             : SSL_CLIENT_HELLO_RETRY;
-}
-#endif
 
 void KeylogCallback(const SSL* s, const char* line) {
   TLSWrap* w = static_cast<TLSWrap*>(SSL_get_app_data(s));
@@ -265,11 +258,13 @@ int SelectALPNCallback(
 
     unsigned int result_int = callback_result.As<Number>()->Value();
 
-    // The callback returns an offset into the given buffer, for the selected
-    // protocol that should be returned. We then set outlen & out to point
-    // to the selected input length & value directly:
-    *outlen = *(in + result_int);
-    *out = (in + result_int + 1);
+    // The callback returns an offset into the given buffer, at which the
+    // selected protocol sits in ALPN wire format: a length byte followed by
+    // that many name bytes.
+    SetSelectedProtocol(
+        out,
+        outlen,
+        {reinterpret_cast<const char*>(in + result_int + 1), in[result_int]});
 
     return SSL_TLSEXT_ERR_OK;
   }
@@ -278,20 +273,20 @@ int SelectALPNCallback(
 
   if (alpn_protos.empty()) return SSL_TLSEXT_ERR_NOACK;
 
-  int status = SSL_select_next_proto(const_cast<unsigned char**>(out),
-                                     outlen,
-                                     alpn_protos.data(),
-                                     alpn_protos.size(),
-                                     in,
-                                     inlen);
+  const std::span<const uint8_t> supported{alpn_protos.data(),
+                                           alpn_protos.size()};
+  const std::span<const uint8_t> offered{in, inlen};
+  auto selected = SelectNextProtocol(supported, offered);
 
   // Previous versions of Node.js returned SSL_TLSEXT_ERR_NOACK if no protocol
   // match was found. This would neither cause a fatal alert nor would it result
   // in a useful ALPN response as part of the Server Hello message.
   // We now return SSL_TLSEXT_ERR_ALERT_FATAL in that case as per Section 3.2
   // of RFC 7301, which causes a fatal no_application_protocol alert.
-  return status == OPENSSL_NPN_NEGOTIATED ? SSL_TLSEXT_ERR_OK
-                                          : SSL_TLSEXT_ERR_ALERT_FATAL;
+  if (!selected.has_value()) return SSL_TLSEXT_ERR_ALERT_FATAL;
+
+  SetSelectedProtocol(out, outlen, *selected);
+  return SSL_TLSEXT_ERR_OK;
 }
 
 MaybeLocal<Value> GetSSLOCSPResponse(Environment* env, SSL* ssl) {
@@ -349,6 +344,10 @@ int TLSExtStatusCallback(SSL* s, void* arg) {
 void ConfigureSecureContext(SecureContext* sc) {
   // OCSP stapling
   sc->ctx().setStatusCallback(TLSExtStatusCallback);
+  // The cert-verify callback (SPKI blocklist and the OpenSSL 4.1 CN name
+  // constraint handling) is installed once per SSL_CTX in
+  // SecureContext::Init, so that it also covers contexts created without a
+  // TLSWrap.
 }
 
 inline bool Set(
@@ -410,7 +409,7 @@ TLSWrap::TLSWrap(Environment* env,
   ssl_ = sc_->CreateSSL();
   CHECK(ssl_);
 
-  sc_->SetClientHelloCallback(EarlyClientHelloCallback);
+  SetClientHelloCallback<EarlyClientHelloCallback>(sc_->ctx().get());
   sc_->SetGetSessionCallback(GetSessionCallback);
   sc_->SetNewSessionCallback(NewSessionCallback);
 
@@ -559,9 +558,9 @@ void TLSWrap::InitSSL() {
   SSL_set_mode(ssl_.get(), SSL_MODE_RELEASE_BUFFERS);
 #endif  // SSL_MODE_RELEASE_BUFFERS
 
-  // This is default in 1.1.1, but set it anyway, Cycle() doesn't currently
-  // re-call ClearIn() if SSL_read() returns SSL_ERROR_WANT_READ, so data can be
-  // left sitting in the incoming enc_in_ and never get processed.
+  // Set SSL_MODE_AUTO_RETRY explicitly because Cycle() doesn't currently
+  // re-call ClearIn() if SSL_read() returns SSL_ERROR_WANT_READ, so data can
+  // be left sitting in the incoming enc_in_ and never get processed.
   // - https://wiki.openssl.org/index.php/TLS1.3#Non-application_data_records
   SSL_set_mode(ssl_.get(), SSL_MODE_AUTO_RETRY);
 
@@ -693,8 +692,8 @@ void TLSWrap::SSLInfoCallback(const SSL* ssl_, int where, int ret) {
     }
   }
 
-  // SSL_CB_HANDSHAKE_START and SSL_CB_HANDSHAKE_DONE are called
-  // sending HelloRequest in OpenSSL-1.1.1.
+  // SSL_CB_HANDSHAKE_START and SSL_CB_HANDSHAKE_DONE are called when sending
+  // HelloRequest.
   // We need to check whether this is in a renegotiation state or not.
   if (where & SSL_CB_HANDSHAKE_DONE && !SSL_renegotiate_pending(ssl)) {
     Debug(c, "SSLInfoCallback(SSL_CB_HANDSHAKE_DONE);");
@@ -866,17 +865,14 @@ void TLSWrap::ClearOut() {
   MarkPopErrorOnReturn mark_pop_error_on_return;
 
   char out[kClearOutChunkSize];
+  int length = 0;
   int read;
-  for (;;) {
-    read = SSL_read(ssl_.get(), out, sizeof(out));
-    Debug(this, "Read %d bytes of cleartext output", read);
 
-    if (read <= 0)
-      break;
-
+  // Emits out[0, length). Returns false if JS destroyed the SSL context.
+  auto emit = [&]() {
     char* current = out;
-    while (read > 0) {
-      int avail = read;
+    while (length > 0) {
+      int avail = length;
 
       uv_buf_t buf = EmitAlloc(avail);
       if (static_cast<int>(buf.len) < avail)
@@ -889,12 +885,45 @@ void TLSWrap::ClearOut() {
       // check that ssl_ != nullptr afterwards.
       if (ssl_ == nullptr) {
         Debug(this, "Returning from read loop, ssl_ == nullptr");
-        return;
+        return false;
       }
 
-      read -= avail;
+      length -= avail;
       current += avail;
     }
+    return true;
+  };
+
+  for (;;) {
+    {
+      SSLLibraryCallScope ssl_library_call_scope(this);
+      if (ERR_set_mark() != 0) ERR_clear_error();
+      read = SSL_read(ssl_.get(), out + length, kClearOutChunkSize - length);
+    }
+    Debug(this, "Read %d bytes of cleartext output", read);
+
+    if (read <= 0) break;
+    length += read;
+
+    // SSL_read() returns at most one record. If the next record is already
+    // buffered, decrypt it into the same chunk instead of emitting one read
+    // per record. This is limited to application data records that are too
+    // long to be empty: other record types can trigger callbacks, e.g. for
+    // renegotiation, that have to run after the preceding data has been
+    // emitted, and SSL_read() skips over empty records to whatever follows.
+    // With read-ahead disabled, enc_in_ is at a record boundary after a
+    // successful read. The header need not be followed by a complete record:
+    // SSL_read() can return WANT_READ, and the path below emits the batch.
+    size_t pending;
+    const unsigned char* next = reinterpret_cast<const unsigned char*>(
+        NodeBIO::FromBIO(enc_in_)->Peek(&pending));
+    if (length < kClearOutChunkSize && pending >= SSL3_RT_HEADER_LENGTH &&
+        next[0] == SSL3_RT_APPLICATION_DATA &&
+        (next[3] << 8 | next[4]) > SSL3_RT_MAX_ENCRYPTED_OVERHEAD) {
+      continue;
+    }
+
+    if (!emit()) return;
   }
 
   // We need to check whether an error occurred or the connection was
@@ -902,13 +931,15 @@ void TLSWrap::ClearOut() {
   // See node#1642 and SSL_read(3SSL) for details. SSL_get_error must be
   // called immediately after SSL_read, without calling into JS, which may
   // change OpenSSL's error queue, modify ssl_, or even destroy ssl_
-  // altogether.
+  // altogether. Data that was read before the failure is emitted once the
+  // error has been captured, before it is reported.
   if (read <= 0) {
     HandleScope handle_scope(env()->isolate());
     Local<Value> error;
     int err = SSL_get_error(ssl_.get(), read);
     switch (err) {
       case SSL_ERROR_ZERO_RETURN:
+        if (!emit()) return;
         if (!flags_.eof) {
           flags_.eof = true;
           EmitRead(UV_EOF);
@@ -935,10 +966,12 @@ void TLSWrap::ClearOut() {
             return;
 
           const char* ls = ERR_lib_error_string(ssl_err);
-#if NCRYPTO_USE_OPENSSL3_PROVIDER
+#if NCRYPTO_USE_OPENSSL_PROVIDER
           const char* fs = nullptr;
-#else
+#elif NCRYPTO_USE_BORINGSSL
           const char* fs = ERR_func_error_string(ssl_err);
+#else
+#error "Unsupported crypto backend"
 #endif
           const char* rs = ERR_reason_error_string(ssl_err);
           if (!Set(env(), obj, env()->library_string(), ls) ||
@@ -958,7 +991,13 @@ void TLSWrap::ClearOut() {
         break;
 
       default:
+        emit();
         return;
+    }
+
+    if (!emit()) {
+      Debug(this, "Got SSL error (%d) but not calling onerror", err);
+      return;
     }
 
     Debug(this, "Got SSL error (%d), calling onerror", err);
@@ -989,7 +1028,12 @@ void TLSWrap::ClearIn() {
   MarkPopErrorOnReturn mark_pop_error_on_return;
 
   NodeBIO::FromBIO(enc_out_)->set_allocate_tls_hint(bs->ByteLength());
-  int written = SSL_write(ssl_.get(), bs->Data(), bs->ByteLength());
+  int written;
+  {
+    SSLLibraryCallScope ssl_library_call_scope(this);
+    if (ERR_set_mark() != 0) ERR_clear_error();
+    written = SSL_write(ssl_.get(), bs->Data(), bs->ByteLength());
+  }
   Debug(this, "Writing %zu bytes, written = %d", bs->ByteLength(), written);
   CHECK(written == -1 || written == static_cast<int>(bs->ByteLength()));
 
@@ -1092,6 +1136,33 @@ int TLSWrap::DoWrite(WriteWrap* w,
     }
   }
 
+  // If we got here from a call inside the OpenSSL/BoringSSL stack, we need to
+  // defer reentrant write calls:
+  if (in_ssl_library_call()) {
+    Debug(this, "Deferring write issued from the SSL library's stack");
+    CHECK(!current_write_);
+    current_write_.reset(w->GetAsyncWrap());
+
+    if (length > 0) {
+      CHECK(!pending_cleartext_input_ ||
+            pending_cleartext_input_->ByteLength() == 0);
+      std::unique_ptr<BackingStore> bs = ArrayBuffer::NewBackingStore(
+          env()->isolate(),
+          length,
+          BackingStoreInitializationMode::kUninitialized);
+      size_t offset = 0;
+      for (i = 0; i < count; i++) {
+        memcpy(
+            static_cast<char*>(bs->Data()) + offset, bufs[i].base, bufs[i].len);
+        offset += bufs[i].len;
+      }
+      pending_cleartext_input_ = std::move(bs);
+    }
+
+    ScheduleDeferredCycle();
+    return 0;
+  }
+
   // We want to trigger a Write() on the underlying stream to drive the stream
   // system, but don't want to encrypt empty buffers into a TLS frame, so see
   // if we can find something to Write().
@@ -1157,12 +1228,20 @@ int TLSWrap::DoWrite(WriteWrap* w,
     }
 
     NodeBIO::FromBIO(enc_out_)->set_allocate_tls_hint(length);
-    written = SSL_write(ssl_.get(), bs->Data(), length);
+    {
+      SSLLibraryCallScope ssl_library_call_scope(this);
+      if (ERR_set_mark() != 0) ERR_clear_error();
+      written = SSL_write(ssl_.get(), bs->Data(), length);
+    }
   } else {
     // Only one buffer: try to write directly, only store if it fails
     uv_buf_t* buf = &bufs[nonempty_i];
     NodeBIO::FromBIO(enc_out_)->set_allocate_tls_hint(buf->len);
-    written = SSL_write(ssl_.get(), buf->base, buf->len);
+    {
+      SSLLibraryCallScope ssl_library_call_scope(this);
+      if (ERR_set_mark() != 0) ERR_clear_error();
+      written = SSL_write(ssl_.get(), buf->base, buf->len);
+    }
 
     if (written == -1) {
       bs = ArrayBuffer::NewBackingStore(
@@ -1248,14 +1327,55 @@ ShutdownWrap* TLSWrap::CreateShutdownWrap(Local<Object> req_wrap_object) {
 
 int TLSWrap::DoShutdown(ShutdownWrap* req_wrap) {
   Debug(this, "DoShutdown()");
+
+  // We must not call SSL_shutdown from inside the TLS library stack, so
+  // defer if required:
+  if (in_ssl_library_call()) {
+    Debug(this, "Deferring shutdown issued from the SSL library's stack");
+    CHECK(!pending_shutdown_);
+    pending_shutdown_.reset(req_wrap->GetAsyncWrap());
+    flags_.shutdown = true;
+    ScheduleDeferredCycle();
+    return 0;
+  }
+
   MarkPopErrorOnReturn mark_pop_error_on_return;
 
-  if (ssl_ && SSL_shutdown(ssl_.get()) == 0)
-    SSL_shutdown(ssl_.get());
+  if (ssl_) {
+    SSLLibraryCallScope ssl_library_call_scope(this);
+    if (SSL_shutdown(ssl_.get()) == 0) SSL_shutdown(ssl_.get());
+  }
 
   flags_.shutdown = true;
   EncOut();
   return underlying_stream()->DoShutdown(req_wrap);
+}
+
+void TLSWrap::ScheduleDeferredCycle() {
+  if (flags_.deferred_cycle_scheduled) return;
+  flags_.deferred_cycle_scheduled = true;
+
+  BaseObjectPtr<TLSWrap> strong_ref{this};
+  env()->SetImmediate([this, strong_ref](Environment* env) {
+    flags_.deferred_cycle_scheduled = false;
+    if (ssl_) Cycle();
+  });
+}
+
+void TLSWrap::FlushPendingShutdown() {
+  if (!pending_shutdown_ || !ssl_) return;
+
+  const bool can_send_close_notify =
+      SSL_is_init_finished(ssl_.get()) && !is_awaiting_new_session();
+  if (!can_send_close_notify) {
+    Debug(this, "Holding deferred shutdown, cannot send close_notify yet");
+    return;
+  }
+
+  BaseObjectPtr<AsyncWrap> pending = std::move(pending_shutdown_);
+  ShutdownWrap* req_wrap = ShutdownWrap::FromObject(pending);
+  int err = DoShutdown(req_wrap);
+  if (err != 0) req_wrap->Done(err);
 }
 
 void TLSWrap::SetVerifyMode(const FunctionCallbackInfo<Value>& args) {
@@ -1353,6 +1473,13 @@ void TLSWrap::Destroy() {
 
   // And destroy
   InvokeQueued(UV_ECANCELED, "Canceled because of SSL destruction");
+
+  // A shutdown held back off the SSL library's stack will never be replayed
+  // now, so complete it here rather than leaving the stream waiting on it.
+  if (pending_shutdown_) {
+    BaseObjectPtr<AsyncWrap> pending = std::move(pending_shutdown_);
+    ShutdownWrap::FromObject(pending)->Done(UV_ECANCELED);
+  }
 
   env()->external_memory_accounter()->Decrease(env()->isolate(), kExternalSize);
   ssl_.reset();
@@ -1765,6 +1892,13 @@ void TLSWrap::GetPeerX509Certificate(const FunctionCallbackInfo<Value>& args) {
     args.GetReturnValue().Set(ret);
 }
 
+void TLSWrap::HasPeerCertificate(const FunctionCallbackInfo<Value>& args) {
+  TLSWrap* w;
+  ASSIGN_OR_RETURN_UNWRAP(&w, args.This());
+  bool has_peer_cert = static_cast<bool>(X509Pointer::PeerFrom(w->ssl_));
+  args.GetReturnValue().Set(has_peer_cert);
+}
+
 void TLSWrap::GetCertificate(const FunctionCallbackInfo<Value>& args) {
   TLSWrap* w;
   ASSIGN_OR_RETURN_UNWRAP(&w, args.This());
@@ -1966,19 +2100,19 @@ void TLSWrap::GetSharedSigalgs(const FunctionCallbackInfo<Value>& args) {
                            nullptr);
 
     switch (sign_nid) {
-      case EVP_PKEY_RSA:
+      case NID_rsaEncryption:
         sig_with_md = "RSA+";
         break;
 
-      case EVP_PKEY_RSA_PSS:
+      case NID_rsassaPss:
         sig_with_md = "RSA-PSS+";
         break;
 
-      case EVP_PKEY_DSA:
+      case NID_dsa:
         sig_with_md = "DSA+";
         break;
 
-      case EVP_PKEY_EC:
+      case NID_X9_62_id_ecPublicKey:
         sig_with_md = "ECDSA+";
         break;
 
@@ -2189,6 +2323,13 @@ void TLSWrap::WritesIssuedByPrevListenerDone(
 }
 
 void TLSWrap::Cycle() {
+  // With no loop to extend, cycling now would re-enter the SSL library.
+  if (cycle_depth_ == 0 && in_ssl_library_call()) {
+    Debug(this, "Deferring cycle requested from the SSL library's stack");
+    ScheduleDeferredCycle();
+    return;
+  }
+
   // Prevent recursion
   if (++cycle_depth_ > 1)
     return;
@@ -2196,6 +2337,10 @@ void TLSWrap::Cycle() {
   for (; cycle_depth_ > 0; cycle_depth_--) {
     ClearIn();
     ClearOut();
+    // ClearOut() could defer a write/shutdown, so we ClearIn() again now
+    // to avoid needing a second pass:
+    ClearIn();
+    FlushPendingShutdown();
     // EncIn() doesn't exist, it happens via stream listener callbacks.
     EncOut();
   }
@@ -2224,6 +2369,12 @@ void TLSWrap::Initialize(
   Isolate* isolate = env->isolate();
 
   SetMethod(context, target, "wrap", TLSWrap::Wrap);
+  SetMethod(context,
+            target,
+            "injectOpenSSLErrorForTesting",
+            InjectOpenSSLErrorForTesting);
+  SetMethodNoSideEffect(
+      context, target, "hasOpenSSLErrorForTesting", HasOpenSSLErrorForTesting);
 
   NODE_DEFINE_CONSTANT(target, HAVE_SSL_TRACE);
 
@@ -2288,6 +2439,8 @@ void TLSWrap::Initialize(
       isolate, t, "getPeerCertificate", GetPeerCertificate);
   SetProtoMethodNoSideEffect(
       isolate, t, "getPeerX509Certificate", GetPeerX509Certificate);
+  SetProtoMethodNoSideEffect(
+      isolate, t, "hasPeerCertificate", HasPeerCertificate);
   SetProtoMethodNoSideEffect(isolate, t, "getPeerFinished", GetPeerFinished);
   SetProtoMethodNoSideEffect(isolate, t, "getProtocol", GetProtocol);
   SetProtoMethodNoSideEffect(isolate, t, "getSession", GetSession);
@@ -2316,6 +2469,8 @@ void TLSWrap::Initialize(
 void TLSWrap::RegisterExternalReferences(ExternalReferenceRegistry* registry) {
   registry->Register(TLSWrap::Wrap);
   registry->Register(GetWriteQueueSize);
+  registry->Register(InjectOpenSSLErrorForTesting);
+  registry->Register(HasOpenSSLErrorForTesting);
 
   registry->Register(CertCbDone);
   registry->Register(ClientHelloDone);
@@ -2347,6 +2502,7 @@ void TLSWrap::RegisterExternalReferences(ExternalReferenceRegistry* registry) {
   registry->Register(GetFinished);
   registry->Register(GetPeerCertificate);
   registry->Register(GetPeerX509Certificate);
+  registry->Register(HasPeerCertificate);
   registry->Register(GetPeerFinished);
   registry->Register(GetProtocol);
   registry->Register(GetSession);

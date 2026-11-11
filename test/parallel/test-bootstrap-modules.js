@@ -118,12 +118,14 @@ expected.atRunTime = new Set([
 
 const { isMainThread } = require('worker_threads');
 // Binaries built without the snapshot (e.g. cross-compiled) and
-// --no-node-snapshot bootstrap the main context from scratch, like a worker.
-const mainContextFromSnapshot = isMainThread &&
+// --no-node-snapshot bootstrap the context from scratch; so do workers under
+// --no-worker-snapshot.
+const contextFromSnapshot =
   process.config.variables.node_use_node_snapshot &&
-  !process.execArgv.includes('--no-node-snapshot');
+  !process.execArgv.includes('--no-node-snapshot') &&
+  (isMainThread || !process.execArgv.includes('--no-worker-snapshot'));
 
-if (mainContextFromSnapshot) {
+if (contextFromSnapshot) {
   [
     'Internal Binding cjs_lexer',
     'NativeModule internal/modules/esm/assert',
@@ -144,36 +146,38 @@ if (mainContextFromSnapshot) {
     'NativeModule internal/mime',
     'NativeModule internal/modules/typescript',
     'NativeModule internal/net',
+    'NativeModule internal/streams/add-abort-signal',
+    'NativeModule internal/streams/destroy',
+    'NativeModule internal/streams/end-of-stream',
+    'NativeModule internal/streams/from',
+    'NativeModule internal/streams/legacy',
+    'NativeModule internal/streams/readable',
+    'NativeModule internal/streams/state',
+    'NativeModule internal/streams/writable',
+    'NativeModule stream',
+    'NativeModule string_decoder',
   ].forEach(expected.beforePreExec.add.bind(expected.beforePreExec));
 } else if (isMainThread) {
   expected.beforePreExec.delete(getFormatNativeModule);
   expected.atRunTime.add(getFormatNativeModule);
-} else {  // Worker.
+}
+if (!isMainThread) {
   [
     'NativeModule diagnostics_channel',
-    'NativeModule internal/abort_controller',
     'NativeModule internal/process/worker_thread_only',
     'NativeModule internal/streams/add-abort-signal',
-    'NativeModule internal/streams/compose',
     'NativeModule internal/streams/destroy',
-    'NativeModule internal/streams/duplex',
-    'NativeModule internal/streams/duplexpair',
     'NativeModule internal/streams/end-of-stream',
     'NativeModule internal/streams/from',
     'NativeModule internal/streams/legacy',
-    'NativeModule internal/streams/operators',
-    'NativeModule internal/streams/passthrough',
-    'NativeModule internal/streams/pipeline',
     'NativeModule internal/streams/readable',
     'NativeModule internal/streams/state',
-    'NativeModule internal/streams/transform',
     'NativeModule internal/streams/utils',
     'NativeModule internal/streams/writable',
     'NativeModule internal/worker',
     'NativeModule internal/worker/io',
     'NativeModule internal/worker/messaging',
     'NativeModule stream',
-    'NativeModule stream/promises',
     'NativeModule string_decoder',
     'NativeModule worker_threads',
   ].forEach(expected.atRunTime.add.bind(expected.atRunTime));

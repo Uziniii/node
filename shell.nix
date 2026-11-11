@@ -18,7 +18,7 @@
   withSQLite ? true,
   withFFI ? true,
   withSSL ? true,
-  withTemporal ? false,
+  withTemporal ? true,
   withPerfetto ? false,
   sharedLibDeps ? (
     import ./tools/nix/sharedLibDeps.nix {
@@ -29,6 +29,7 @@
         withSQLite
         withFFI
         withSSL
+        withPerfetto
         withTemporal
         ;
     }
@@ -47,13 +48,24 @@
   benchmarkTools ? import ./tools/nix/benchmarkTools.nix { inherit pkgs; },
 }:
 
+assert pkgs.lib.assertMsg (
+  withTemporal || !(builtins.hasAttr "temporal_capi" sharedLibDeps)
+) "`sharedLibDeps` must not contain `temporal_capi` when `withTemporal` is false";
+assert pkgs.lib.assertMsg (
+  withPerfetto || !(builtins.hasAttr "perfetto" sharedLibDeps)
+) "`sharedLibDeps` must not contain `perfetto` when `withPerfetto` is false";
+
 let
   useSharedICU = if builtins.isString icu then icu == "system" else icu != null;
-  useSharedAda = builtins.hasAttr "ada" sharedLibDeps;
-  useSharedOpenSSL = builtins.hasAttr "openssl" sharedLibDeps;
+  needsRustCompiler = withTemporal && !(builtins.hasAttr "temporal_capi" sharedLibDeps);
 
-  useSharedTemporal = builtins.hasAttr "temporal_capi" sharedLibDeps;
-  needsRustCompiler = withTemporal && !useSharedTemporal;
+  sharedV8Deps = builtins.filter (depName: builtins.hasAttr depName sharedLibDeps) ([
+    "abseil"
+    "highway"
+    "perfetto"
+    "simdutf"
+    "temporal_capi"
+  ]);
 
   nativeBuildInputs =
     pkgs.nodejs-slim_latest.nativeBuildInputs
@@ -62,8 +74,7 @@ let
       pkgs.rustc
     ];
   buildInputs =
-    pkgs.lib.optional useSharedICU icu
-    ++ pkgs.lib.optional (withTemporal && useSharedTemporal) sharedLibDeps.temporal_capi;
+    pkgs.lib.optional useSharedICU icu ++ builtins.map (depName: sharedLibDeps.${depName}) sharedV8Deps;
 
   # Put here only the configure flags that affect the V8 build
   configureFlags = [
@@ -75,29 +86,33 @@ let
     )
     "--v8-${if withTemporal then "enable" else "disable"}-temporal-support"
   ]
-  ++ pkgs.lib.optional (withTemporal && useSharedTemporal) "--shared-temporal_capi"
+  ++ builtins.map (depName: "--shared-${depName}") sharedV8Deps
   ++ pkgs.lib.optional withPerfetto "--with-perfetto";
+
+  v8Derivation =
+    if useSeparateDerivationForV8 == true then
+      let
+        sharedLibsToMock = pkgs.callPackage ./tools/nix/non-v8-deps-mock.nix { };
+      in
+      pkgs.callPackage ./tools/nix/v8.nix {
+        inherit nativeBuildInputs icu;
+
+        configureFlags = configureFlags ++ sharedLibsToMock.configureFlags ++ [ "--ninja" ];
+        buildInputs = buildInputs ++ [ sharedLibsToMock ];
+      }
+    else
+      useSeparateDerivationForV8;
 in
 pkgs.mkShell {
   inherit nativeBuildInputs;
 
+  # `_FORTIFY_SOURCE` requires optimization, which debug builds do not have.
+  hardeningDisable = [ "fortify" ];
+
   buildInputs =
     builtins.attrValues sharedLibDeps
     ++ buildInputs
-    ++ pkgs.lib.optional (useSeparateDerivationForV8 != false) (
-      if useSeparateDerivationForV8 == true then
-        let
-          sharedLibsToMock = pkgs.callPackage ./tools/nix/non-v8-deps-mock.nix { };
-        in
-        pkgs.callPackage ./tools/nix/v8.nix {
-          inherit nativeBuildInputs icu;
-
-          configureFlags = configureFlags ++ sharedLibsToMock.configureFlags ++ [ "--ninja" ];
-          buildInputs = buildInputs ++ [ sharedLibsToMock ];
-        }
-      else
-        useSeparateDerivationForV8
-    );
+    ++ pkgs.lib.optional (useSeparateDerivationForV8 != false) v8Derivation;
 
   packages = devTools ++ benchmarkTools ++ pkgs.lib.optional (ccache != null) ccache;
 
@@ -105,6 +120,10 @@ pkgs.mkShell {
     export CC="${pkgs.lib.getExe ccache} $CC"
     export CXX="${pkgs.lib.getExe ccache} $CXX"
   '';
+
+  passthru = {
+    inherit v8Derivation;
+  };
 
   env = {
     BUILD_WITH = if (ninja != null) then "ninja" else "make";
@@ -121,28 +140,53 @@ pkgs.mkShell {
       ++ pkgs.lib.optional (!withSSL) "--without-ssl"
       ++ pkgs.lib.optional loadJSBuiltinsDynamically "--node-builtin-modules-path=${builtins.toString ./.}"
       ++ pkgs.lib.optional (useSeparateDerivationForV8 != false) "--without-bundled-v8"
-      ++
-        pkgs.lib.concatMap
-          (name: [
-            "--shared-${name}"
-            "--shared-${name}-libpath=${pkgs.lib.getLib sharedLibDeps.${name}}/lib"
-            "--shared-${name}-include=${pkgs.lib.getInclude sharedLibDeps.${name}}/include"
-          ])
-          (
-            builtins.attrNames (
-              if (useSeparateDerivationForV8 != false) then
-                builtins.removeAttrs sharedLibDeps [
-                  "simdutf"
-                  "temporal_capi"
-                ]
-              else
-                sharedLibDeps
-            )
-          )
+      ++ builtins.map (name: "--shared-${name}") (
+        builtins.attrNames (
+          if (useSeparateDerivationForV8 != false) then
+            builtins.removeAttrs sharedLibDeps sharedV8Deps
+          else
+            sharedLibDeps
+        )
+      )
     );
+
+    # CA bundle built from the vendored Mozilla trust store, so Nix-built tools
+    # (curl, git, shared OpenSSL) don't fall back to the user's possibly stale one.
+    NIX_SSL_CERT_FILE = "${
+      pkgs.cacert.overrideAttrs {
+        src = ./tools/certdata.txt;
+      }
+    }/etc/ssl/certs/ca-bundle.crt";
   }
+  // (
+    let
+      ruff = pkgs.lib.lists.findFirst (p: p.meta.mainProgram == "ruff") null devTools;
+    in
+    pkgs.lib.optionalAttrs (ruff != null) {
+      RUFF = pkgs.lib.getExe ruff;
+    }
+  )
+  // (
+    let
+      yamllint = pkgs.lib.lists.findFirst (p: p.meta.mainProgram == "yamllint") null devTools;
+    in
+    pkgs.lib.optionalAttrs (yamllint != null) {
+      YAMLLINT = pkgs.lib.getExe yamllint;
+    }
+  )
+  // (
+    let
+      treefmt = pkgs.lib.lists.findFirst (p: p.meta.mainProgram == "treefmt") null devTools;
+    in
+    pkgs.lib.optionalAttrs (treefmt != null) {
+      NIX_LINTER = pkgs.lib.getExe treefmt;
+    }
+  )
   // pkgs.lib.optionalAttrs (!withSQLite) {
     NOSQLITE = "1";
+  }
+  // pkgs.lib.optionalAttrs (withPerfetto) {
+    TRACE_PROCESSOR_SHELL_PATH = "${pkgs.perfetto.tools}/bin/trace_processor_shell";
   }
   // pkgs.lib.optionalAttrs (pkcs11 != false && pkcs11 != null) (
     let

@@ -39,6 +39,10 @@ constexpr size_t kDefaultMaxSettings = 10;
 // Default maximum total memory cap for Http2Session.
 constexpr uint64_t kDefaultMaxSessionMemory = 10000000;
 
+// Default connection-level flow control window (32MB) to improve throughput
+// on high-latency connections. See https://github.com/nodejs/node/issues/38426
+constexpr int32_t kDefaultConnectionWindowSize = 33554432;
+
 // These are the standard HTTP/2 defaults as specified by the RFC
 constexpr uint32_t DEFAULT_SETTINGS_HEADER_TABLE_SIZE = 4096;
 constexpr uint32_t DEFAULT_SETTINGS_ENABLE_PUSH = 1;
@@ -50,10 +54,6 @@ constexpr uint32_t DEFAULT_SETTINGS_ENABLE_CONNECT_PROTOCOL = 0;
 constexpr uint32_t MAX_MAX_FRAME_SIZE = 16777215;
 constexpr uint32_t MIN_MAX_FRAME_SIZE = DEFAULT_SETTINGS_MAX_FRAME_SIZE;
 constexpr uint32_t MAX_INITIAL_WINDOW_SIZE = 2147483647;
-
-// Default local connection window size (32MB) to improve throughput
-// on high-latency connections. See https://github.com/nodejs/node/issues/38426
-constexpr uint32_t DEFAULT_SETTINGS_LOCAL_CONNECTION_WINDOW_SIZE = 33554432;
 
 // Stream is not going to have any DATA frames
 constexpr int STREAM_OPTION_EMPTY_PAYLOAD = 0x1;
@@ -85,9 +85,8 @@ constexpr int kSessionStateClosing = 0x8;
 constexpr int kSessionStateSending = 0x10;
 constexpr int kSessionStateWriteInProgress = 0x20;
 constexpr int kSessionStateReadingStopped = 0x40;
-constexpr int kSessionStateReceivePaused = 0x80;
-constexpr int kSessionStateReceiving = 0x100;
-constexpr int kSessionStateClosePending = 0x200;
+constexpr int kSessionStateReceiving = 0x80;
+constexpr int kSessionStateClosePending = 0x100;
 
 // The Padding Strategy determines the method by which extra padding is
 // selected for HEADERS and DATA frames. These are configurable via the
@@ -246,9 +245,16 @@ class Http2Options {
     return max_session_memory_;
   }
 
+  void set_connection_window_size(int32_t size) {
+    connection_window_size_ = size;
+  }
+
+  int32_t connection_window_size() const { return connection_window_size_; }
+
  private:
   Nghttp2OptionPointer options_;
   uint64_t max_session_memory_ = kDefaultMaxSessionMemory;
+  int32_t connection_window_size_ = kDefaultConnectionWindowSize;
   uint32_t max_header_pairs_ = DEFAULT_MAX_HEADER_LIST_PAIRS;
   PaddingStrategy padding_strategy_ = PADDING_STRATEGY_NONE;
   size_t max_outstanding_pings_ = kDefaultMaxPings;
@@ -698,7 +704,6 @@ class Http2Session : public AsyncWrap,
   IS_FLAG(sending, kSessionStateSending)
   IS_FLAG(write_in_progress, kSessionStateWriteInProgress)
   IS_FLAG(reading_stopped, kSessionStateReadingStopped)
-  IS_FLAG(receive_paused, kSessionStateReceivePaused)
   IS_FLAG(receiving, kSessionStateReceiving)
   IS_FLAG(close_pending, kSessionStateClosePending)
 
@@ -789,6 +794,7 @@ class Http2Session : public AsyncWrap,
   BaseObjectPtr<Http2Ping> PopPing();
   bool AddPing(const uint8_t* data, v8::Local<v8::Function> callback);
   bool HasPendingData() const;
+  bool HasStreamsAbandonedByNghttp2() const;
 
   BaseObjectPtr<Http2Settings> PopSettings();
   bool AddSettings(v8::Local<v8::Function> callback);
@@ -805,6 +811,17 @@ class Http2Session : public AsyncWrap,
   void UpdateLocalCustomSettings(size_t count_,
                                  nghttp2_settings_entry* entries_);
 
+  void IncrementQueuedOutboundMemory(uint64_t amount) {
+    queued_outbound_memory_ += amount;
+    IncrementCurrentSessionMemory(amount);
+  }
+
+  void DecrementQueuedOutboundMemory(uint64_t amount) {
+    DCHECK_LE(amount, queued_outbound_memory_);
+    queued_outbound_memory_ -= amount;
+    DecrementCurrentSessionMemory(amount);
+  }
+
   // Tell our custom memory allocator that this rcbuf is independent of
   // this session now, and may outlive it.
   void StopTrackingRcbuf(nghttp2_rcbuf* buf);
@@ -818,9 +835,17 @@ class Http2Session : public AsyncWrap,
     return total;
   }
 
-  // Return true if current_session_memory + amount is less than the max
-  bool has_available_session_memory(uint64_t amount) const {
-    return current_session_memory() + amount <= max_session_memory_;
+  // Headers on local client streams may exclude queued outbound DATA, but
+  // retained headers and all other session memory still count towards the
+  // limit.
+  bool has_available_session_memory(uint64_t amount,
+                                    bool exclude_outbound = false) const {
+    uint64_t memory = current_session_memory();
+    if (exclude_outbound) {
+      DCHECK_LE(queued_outbound_memory_, memory);
+      memory -= queued_outbound_memory_;
+    }
+    return memory + amount <= max_session_memory_;
   }
 
   struct Statistics {
@@ -960,6 +985,8 @@ class Http2Session : public AsyncWrap,
   // The maximum amount of memory allocated for this session
   uint64_t max_session_memory_ = kDefaultMaxSessionMemory;
   uint64_t current_session_memory_ = 0;
+  // Part of current_session_memory_: DATA not yet consumed by nghttp2.
+  uint64_t queued_outbound_memory_ = 0;
   // The amount of memory allocated by nghttp2 internals
   uint64_t current_nghttp2_memory_ = 0;
 
@@ -979,7 +1006,6 @@ class Http2Session : public AsyncWrap,
   // will be set. stream_buf_ab_ is lazily created from stream_buf_allocation_.
   v8::Global<v8::ArrayBuffer> stream_buf_ab_;
   std::unique_ptr<v8::BackingStore> stream_buf_allocation_;
-  size_t stream_buf_offset_ = 0;
   // Custom error code for errors that originated inside one of the callbacks
   // called by nghttp2_session_mem_recv.
   const char* custom_recv_error_code_ = nullptr;

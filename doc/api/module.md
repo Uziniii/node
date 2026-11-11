@@ -2,19 +2,30 @@
 
 <!--introduced_in=v12.20.0-->
 
+> Stability: 2 - Stable
+
+<!-- source_link=lib/module.js -->
+
+The `node:module` module provides utilities for interacting with the Node.js
+module system.
+
+It can be accessed using:
+
+```mjs
+import module from 'node:module';
+```
+
+## Class: `Module`
+
 <!-- YAML
-added: v0.3.7
+added: v0.3.5
 -->
 
-## The `Module` object
+`module` objects in [CommonJS][] modules are instances of this class.
 
-* Type: {Object}
+See the CommonJS documentation for [the `module` object][].
 
-Provides general utility methods when interacting with instances of
-`Module`, the [`module`][] variable often seen in [CommonJS][] modules. Accessed
-via `import 'node:module'` or `require('node:module')`.
-
-### `module.builtinModules`
+## `module.builtinModules`
 
 <!-- YAML
 added:
@@ -29,25 +40,18 @@ changes:
 
 * Type: {string\[]}
 
-A list of the names of all modules provided by Node.js. Can be used to verify
-if a module is maintained by a third party or not.
-
-`module` in this context isn't the same object that's provided
-by the [module wrapper][]. To access it, require the `Module` module:
+A list of the names of all modules provided by Node.js.
 
 ```mjs
-// module.mjs
-// In an ECMAScript module
-import { builtinModules as builtin } from 'node:module';
+import { builtinModules } from 'node:module';
+console.log(builtinModules.filter((name) => name.startsWith('path')));
+// Prints: [ 'path', 'path/posix', 'path/win32' ]
 ```
 
-```cjs
-// module.cjs
-// In a CommonJS module
-const builtin = require('node:module').builtinModules;
-```
+To test whether a module name corresponds to a builtin module, use
+[`module.isBuiltin()`][].
 
-### `module.createRequire(filename)`
+## `module.createRequire(filename)`
 
 <!-- YAML
 added: v12.2.0
@@ -66,7 +70,7 @@ const require = createRequire(import.meta.url);
 const siblingModule = require('./sibling-module');
 ```
 
-### `module.findPackageJSON(specifier[, base])`
+## `module.findPackageJSON(specifier[, base])`
 
 <!-- YAML
 added:
@@ -154,7 +158,7 @@ findPackageJSON('@foo/qux', __filename);
 // '/path/to/project/packages/qux/package.json'
 ```
 
-### `module.isBuiltin(moduleName)`
+## `module.isBuiltin(moduleName)`
 
 <!-- YAML
 added:
@@ -172,7 +176,7 @@ isBuiltin('fs'); // true
 isBuiltin('wss'); // false
 ```
 
-### `module.register(specifier[, parentURL][, options])`
+## `module.register(specifier[, parentURL][, options])`
 
 <!-- YAML
 added:
@@ -222,7 +226,7 @@ resolution and loading behavior. See [Customization hooks][].
 
 This feature requires `--allow-worker` if used with the [Permission Model][].
 
-### `module.registerHooks(options)`
+## `module.registerHooks(options)`
 
 <!-- YAML
 added:
@@ -251,7 +255,7 @@ Register [hooks][] that customize Node.js module resolution and loading behavior
 See [Customization hooks][]. The returned object can be used to
 [deregister the hooks][deregistration of synchronous customization hooks].
 
-### `module.stripTypeScriptTypes(code[, options])`
+## `module.stripTypeScriptTypes(code[, options])`
 
 <!-- YAML
 added:
@@ -316,7 +320,7 @@ console.log(strippedCode);
 // Prints: const a         = 1\n\n//# sourceURL=source.ts;
 ```
 
-### `module.syncBuiltinESMExports()`
+## `module.syncBuiltinESMExports()`
 
 <!-- YAML
 added: v12.12.0
@@ -367,8 +371,9 @@ changes:
 
 The module compile cache can be enabled either using the [`module.enableCompileCache()`][]
 method or the [`NODE_COMPILE_CACHE=dir`][] environment variable. After it is enabled,
-whenever Node.js compiles a CommonJS, an ECMAScript Module, or a TypeScript module, it will
-use on-disk [V8 code cache][] persisted in the specified directory to speed up the compilation.
+whenever Node.js compiles a CommonJS, an ECMAScript Module, a TypeScript module, or a
+WebAssembly module, it will use on-disk [V8 code cache][] persisted in the specified
+directory to speed up the compilation.
 This may slow down the first load of a module graph, but subsequent loads of the same module
 graph may get a significant speedup if the contents of the modules do not change.
 
@@ -428,6 +433,25 @@ There are two ways to enable the portable mode:
    ```
 
 2. Setting the environment variable: [`NODE_COMPILE_CACHE_PORTABLE=1`][]
+
+### WebAssembly modules in the compile cache
+
+For WebAssembly modules loaded through the ES module integration, the compile cache stores
+the machine code that V8 has generated for the module when it is compiled. V8 only
+serializes code produced by its optimizing compiler. By default WebAssembly functions are
+compiled lazily with a baseline compiler and only optimized once they run hot, so at the time
+a module is compiled there is typically no optimized code and no cache entry is written.
+
+To cache WebAssembly modules, compile all functions with the optimizing compiler when the
+module is created:
+
+```console
+$ NODE_COMPILE_CACHE=/path/to/cache node --no-liftoff --no-wasm-lazy-compilation app.js
+```
+
+This makes the first, uncached load of a module slower in exchange for later loads skipping
+compilation entirely. Since V8 flags are part of the cache key, the same flags must be
+used for all processes sharing the cache.
 
 ### Read-only compile cache
 
@@ -511,7 +535,7 @@ The following constants are returned as the `status` field in the object returne
 <!-- YAML
 added: v22.8.0
 changes:
-  - version: REPLACEME
+  - version: v26.8.0
     pr-url: https://github.com/nodejs/node/pull/65302
     description: Add the `readOnly` option.
   - version:
@@ -1278,6 +1302,13 @@ register('./my-hooks.mjs', {
 });
 ```
 
+A hook can send messages to the thread that registered it at any time, as
+above. It must not block on a reply from that thread: resolution and loading
+are synchronous from the perspective of the thread that triggered them, so that
+thread is blocked until the hook settles and cannot answer in the meantime.
+Hooks can otherwise be fully asynchronous; it is only a reply over this
+message channel that cannot be awaited.
+
 #### Asynchronous hooks accepted by `module.register()`
 
 <!-- YAML
@@ -1990,7 +2021,7 @@ generated code.
 
 <!-- YAML
 changes:
-  - version: REPLACEME
+  - version: v27.0.0-alpha.0.0.0
     pr-url: https://github.com/nodejs/node/pull/62830
     description: The object is frozen.
 -->
@@ -2094,9 +2125,9 @@ returned object contains the following keys:
 [`module.enableCompileCache()`]: #moduleenablecompilecacheoptions
 [`module.flushCompileCache()`]: #moduleflushcompilecache
 [`module.getCompileCacheDir()`]: #modulegetcompilecachedir
+[`module.isBuiltin()`]: #moduleisbuiltinmodulename
 [`module.registerHooks()`]: #moduleregisterhooksoptions
 [`module.setSourceMapsSupport()`]: #modulesetsourcemapssupportenabled-options
-[`module`]: #the-module-object
 [`os.tmpdir()`]: os.md#ostmpdir
 [`register`]: #moduleregisterspecifier-parenturl-options
 [`util.TextDecoder`]: util.md#class-utiltextdecoder
@@ -2109,11 +2140,11 @@ returned object contains the following keys:
 [hooks]: #customization-hooks
 [load hook]: #synchronous-loadurl-context-nextload
 [module compile cache]: #module-compile-cache
-[module wrapper]: modules.md#the-module-wrapper
 [realm]: https://tc39.es/ecma262/#realm
 [resolve hook]: #synchronous-resolvespecifier-context-nextresolve
 [source map include directives]: https://tc39.es/ecma426/#sec-linking-generated-code
 [synchronous hook functions]: #hook-functions-accepted-by-moduleregisterhooks
+[the `module` object]: modules.md#the-module-object
 [the documentation of `Worker`]: worker_threads.md#new-workerfilename-options
 [transferable objects]: worker_threads.md#portpostmessagevalue-transferlist
 [type-stripping]: typescript.md#type-stripping
